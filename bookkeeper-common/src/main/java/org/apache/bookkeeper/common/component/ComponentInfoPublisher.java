@@ -96,10 +96,10 @@ public class ComponentInfoPublisher {
     public void publishProperty(String key, String value) {
         log.info("publish {}={}", key, value);
         if (startupFinished) {
-            throw new IllegalStateException("Server already started, cannot publish "+key);
+            throw new IllegalStateException("Server already started, cannot publish " + key);
         }
         Objects.requireNonNull(key);
-        Objects.requireNonNull(value, "Value for "+key+" cannot be null");
+        Objects.requireNonNull(value, "Value for " + key + " cannot be null");
 
         properties.put(key, value);
     }

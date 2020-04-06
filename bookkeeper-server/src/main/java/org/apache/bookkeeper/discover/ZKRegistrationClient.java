@@ -18,19 +18,18 @@
 
 package org.apache.bookkeeper.discover;
 
+import static com.google.common.base.Charsets.UTF_8;
 import static org.apache.bookkeeper.util.BookKeeperConstants.AVAILABLE_NODE;
 import static org.apache.bookkeeper.util.BookKeeperConstants.COOKIE_NODE;
 import static org.apache.bookkeeper.util.BookKeeperConstants.READONLY;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.Sets;
+import com.google.protobuf.TextFormat;
 import java.io.IOException;
-import java.nio.charset.StandardCharsets;
+import java.net.UnknownHostException;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArraySet;
@@ -38,6 +37,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
+import java.util.stream.Collectors;
 import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
@@ -46,6 +46,7 @@ import org.apache.bookkeeper.client.BKException.ZKException;
 import org.apache.bookkeeper.common.concurrent.FutureUtils;
 import org.apache.bookkeeper.common.util.SafeRunnable;
 import org.apache.bookkeeper.net.BookieSocketAddress;
+import org.apache.bookkeeper.proto.DataFormats.BookieServiceInfoFormat;
 import org.apache.bookkeeper.versioning.LongVersion;
 import org.apache.bookkeeper.versioning.Version;
 import org.apache.bookkeeper.versioning.Version.Occurred;
@@ -63,8 +64,6 @@ import org.apache.zookeeper.data.Stat;
  */
 @Slf4j
 public class ZKRegistrationClient implements RegistrationClient {
-
-    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     static final int ZK_CONNECT_BACKOFF_MS = 200;
 
@@ -239,7 +238,20 @@ public class ZKRegistrationClient implements RegistrationClient {
                     } else if (KeeperException.Code.NONODE.intValue() == rc2) {
                         // not found as readonly, the bookie is offline
                         // return an empty BookieServiceInfoStructure
-                        res.complete(new Versioned<>(deserializeBookieService(null), new LongVersion(0)));
+                        BookieSocketAddress address = null;
+                        try {
+                            address = new BookieSocketAddress(bookieId);
+                        } catch (UnknownHostException err) {
+                            res.completeExceptionally(KeeperException.create(KeeperException.Code.get(rc2), path2));
+                            return;
+                        }
+                        BookieServiceInfo.Endpoint endpoint = new BookieServiceInfo.Endpoint();
+                        endpoint.setId(bookieId);
+                        endpoint.setHost(address.getHostName());
+                        endpoint.setPort(address.getPort());
+                        endpoint.setProtocol("bookie-rpc");
+                        BookieServiceInfo emptyBookieServiceInfo = new BookieServiceInfo(Collections.emptyMap(), List.of(endpoint));
+                        res.complete(new Versioned<>(emptyBookieServiceInfo, new LongVersion(0)));
                     } else {
                         res.completeExceptionally(KeeperException.create(KeeperException.Code.get(rc2), path2));
                     }
@@ -253,17 +265,40 @@ public class ZKRegistrationClient implements RegistrationClient {
 
     @SuppressWarnings("unchecked")
     private static BookieServiceInfo deserializeBookieService(byte[] bookieServiceInfo) {
-        if (bookieServiceInfo != null && bookieServiceInfo.length > 0) {
-            try {
-                return MAPPER.readValue(bookieServiceInfo, BookieServiceInfo.class);
-            } catch (IOException err) {
-                log.error("Cannot deserialize bookieServiceInfo from "
-                        + new String(bookieServiceInfo, StandardCharsets.UTF_8), err);
-            }
+        if (bookieServiceInfo == null || bookieServiceInfo.length == 0) {
+            // Empty BookieServiceInfoStructure
+            // ComponentInfoPublisher.EndpointInfo endpoint = new ComponentInfoPublisher.EndpointInfo("bookie", 
+            // localAddress.getPort(), localAddress.getHostName(), "bookie-rpc", null, extensions);
+            throw new RuntimeException("Not found");
         }
-        return BookieServiceInfo.EMPTY;
-    }
 
+        try {
+            BookieServiceInfoFormat.Builder builder = BookieServiceInfoFormat.newBuilder();
+            TextFormat.merge(new String(bookieServiceInfo, UTF_8), builder);
+
+            BookieServiceInfo bsi = new BookieServiceInfo();
+            List<BookieServiceInfo.Endpoint> endpoints = builder.getEndpointsList().stream()
+                    .map(e -> {
+                        BookieServiceInfo.Endpoint endpoint = new BookieServiceInfo.Endpoint();
+                        endpoint.setId(e.getId());
+                        endpoint.setPort(e.getPort());
+                        endpoint.setHost(e.getHost());
+                        endpoint.setProtocol(e.getProtocol());
+                        endpoint.setAuth(e.getAuthList());
+                        endpoint.setExtensions(e.getExtensionsList());
+                        return endpoint;
+                    })
+                    .collect(Collectors.toList());
+
+            bsi.setEndpoints(endpoints);
+            bsi.setProperties(builder.getPropertiesMap());
+
+            return bsi;
+        } catch (IOException err) {
+            log.error("Cannot deserialize bookieServiceInfo from " + new String(bookieServiceInfo, UTF_8), err);
+            throw new RuntimeException(err);
+        }
+    }
 
     private CompletableFuture<Versioned<Set<BookieSocketAddress>>> getChildren(String regPath, Watcher watcher) {
         CompletableFuture<Versioned<Set<BookieSocketAddress>>> future = FutureUtils.createFuture();
